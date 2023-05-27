@@ -1,153 +1,131 @@
-import argparse
+from __future__ import  absolute_import
 import os
 
-import torch
-import torch.optim as optim
-import numpy as np
+import ipdb
+import matplotlib
+from tqdm import tqdm
 
-from darknet import DarkNet
-from img_loader import Data_loader
-from torch.utils.tensorboard import SummaryWriter
-from utils import load_classes, predict, evaluate
-import os 
-os.environ["CUDA_VISIBLE_DEVICES"] = "2"
+from utils.config import opt
+from data.dataset import Dataset, TestDataset, inverse_normalize
+from model import FasterRCNNVGG16
+from torch.utils import data as data_
+from trainer import FasterRCNNTrainer
+from utils import array_tool as at
+from utils.vis_tool import visdom_bbox
+from utils.eval_tool import eval_detection_voc
+
+# fix for ulimit
+# https://github.com/pytorch/pytorch/issues/973#issuecomment-346405667
+import resource
+
+rlimit = resource.getrlimit(resource.RLIMIT_NOFILE)
+resource.setrlimit(resource.RLIMIT_NOFILE, (20480, rlimit[1]))
+
+matplotlib.use('agg')
 
 
-parser = argparse.ArgumentParser(description='YOLO-v3 Train')
-parser.add_argument("--epoch", type=int, default=50)
-parser.add_argument("--batch_size", type=int, default=16)
-parser.add_argument('--img_size', type=int, default=416)
-parser.add_argument('--no_cuda', action='store_true')
-parser.add_argument('--max_objects', type=int, default=50)
-parser.add_argument("--confidence", type=float, default=0.5)
-parser.add_argument("--nms_conf", type=float, default=0.45)
-parser.add_argument("--pretrain",type=bool,default=True)
+def eval(dataloader, faster_rcnn, test_num=10000):
+    pred_bboxes, pred_labels, pred_scores = list(), list(), list()
+    gt_bboxes, gt_labels, gt_difficults = list(), list(), list()
+    for ii, (imgs, sizes, gt_bboxes_, gt_labels_, gt_difficults_) in tqdm(enumerate(dataloader)):
+        sizes = [sizes[0][0].item(), sizes[1][0].item()]
+        pred_bboxes_, pred_labels_, pred_scores_ = faster_rcnn.predict(imgs, [sizes])
+        gt_bboxes += list(gt_bboxes_.numpy())
+        gt_labels += list(gt_labels_.numpy())
+        gt_difficults += list(gt_difficults_.numpy())
+        pred_bboxes += pred_bboxes_
+        pred_labels += pred_labels_
+        pred_scores += pred_scores_
+        if ii == test_num: break
+
+    result = eval_detection_voc(
+        pred_bboxes, pred_labels, pred_scores,
+        gt_bboxes, gt_labels, gt_difficults,
+        use_07_metric=True)
+    return result
 
 
-def train():
+def train(**kwargs):
+    opt._parse(kwargs)
 
-    args = parser.parse_args()
-    use_cuda = torch.cuda.is_available() and not args.no_cuda
+    dataset = Dataset(opt)
+    print('load data')
+    dataloader = data_.DataLoader(dataset, \
+                                  batch_size=1, \
+                                  shuffle=True, \
+                                  # pin_memory=True,
+                                  num_workers=opt.num_workers)
+    testset = TestDataset(opt)
+    test_dataloader = data_.DataLoader(testset,
+                                       batch_size=1,
+                                       num_workers=opt.test_num_workers,
+                                       shuffle=False, \
+                                       pin_memory=True
+                                       )
+    faster_rcnn = FasterRCNNVGG16()
+    print('model construct completed')
+    trainer = FasterRCNNTrainer(faster_rcnn).cuda()
+    if opt.load_path:
+        trainer.load(opt.load_path)
+        print('load pretrained model from %s' % opt.load_path)
+    trainer.vis.log(dataset.db.label_names, win='labels')
+    best_map = 0
+    lr_ = opt.lr
+    for epoch in range(opt.epoch):
+        trainer.reset_meters()
+        for ii, (img, bbox_, label_, scale) in tqdm(enumerate(dataloader)):
+            scale = at.scalar(scale)
+            img, bbox, label = img.cuda().float(), bbox_.cuda(), label_.cuda()
+            trainer.train_step(img, bbox, label, scale)
 
-    classes = load_classes()
-    num_classes = len(classes)
+            if (ii + 1) % opt.plot_every == 0:
+                if os.path.exists(opt.debug_file):
+                    ipdb.set_trace()
 
-    model = DarkNet(use_cuda, num_classes)
-    if use_cuda:
-        model = model.cuda()
-    optimizer = torch.optim.SGD(model.parameters(),lr = 0.001,momentum=0.9,weight_decay=5e-04)
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer,20,0.1)
-    if args.pretrain:
-        param = (torch.load('coco_weights.pt'))['model']
-        for k in list(param.keys()):
-            if k.find('pred')>=0 and k.find('6')>=0:
-                del param[k]
-        model.load_state_dict(param,strict=False)
-    
-    training_data = Data_loader(
-        "/home/leijingshi/data/VOCdevkit/VOC2007/labels/train/",
-        "/home/leijingshi/data/VOCdevkit/VOC2007/JPEGImages/",
-        img_size=args.img_size,
-        max_objects=args.max_objects,
-        batch_size=args.batch_size,
-        is_cuda=use_cuda)
+                # plot loss
+                trainer.vis.plot_many(trainer.get_meter_data(), ii)
 
-    test_data = Data_loader(
-        "/home/leijingshi/data/VOCdevkit/VOC2007/labels/test/",
-        "/home/leijingshi/data/VOCdevkit/VOC2007/JPEGImages/",
-        img_size=args.img_size,
-        max_objects=args.max_objects,
-        batch_size=args.batch_size,
-        is_cuda=use_cuda)
-        
-    writer = SummaryWriter("tensorboard/YOLO")
-    iteration = 0
-    for epoch in range(args.epoch):
+                # plot groud truth bboxes
+                ori_img_ = inverse_normalize(at.tonumpy(img[0]))
+                gt_img = visdom_bbox(ori_img_,
+                                     at.tonumpy(bbox_[0]),
+                                     at.tonumpy(label_[0]))
+                trainer.vis.img('gt_img', gt_img, ii)
 
-        model.train()
-        for batch_i, (imgs, labels) in enumerate(training_data):
-            iteration += 1
-            optimizer.zero_grad()
-            loss, gather_losses = model(imgs, labels)
-            loss.backward()
-            optimizer.step()
-            writer.add_scalar("train_loss", loss, iteration)
+                # plot predicti bboxes
+                _bboxes, _labels, _scores = trainer.faster_rcnn.predict([ori_img_], visualize=True)
+                pred_img = visdom_bbox(ori_img_,
+                                       at.tonumpy(_bboxes[0]),
+                                       at.tonumpy(_labels[0]).reshape(-1),
+                                       at.tonumpy(_scores[0]))
+                trainer.vis.img('pred_img', pred_img, ii)
 
-            print(f"""[Epoch {epoch+1}/{args.epoch},Batch {batch_i+1}/{training_data.stop_step}] [Losses: x {gather_losses["x"]:.5f}, y {gather_losses["y"]:.5f}, w {gather_losses["w"]:.5f}, h { gather_losses["h"]:.5f}, conf {gather_losses["conf"]:.5f}, cls {gather_losses["cls"]:.5f}, total {loss.item():.5f}, recall: {gather_losses["recall"]:.5f}, precision: {gather_losses["precision"]:.5f}]""")
-        
-        scheduler.step()
-        mAP,l,mIoU = test(test_data,args.nms_conf,args.confidence,model,num_classes,args.img_size,epoch) 
-        writer.add_scalar("mAP", mAP, epoch)
-        writer.add_scalar("l", l, epoch)
-        writer.add_scalar("mIoU", mIoU, epoch)
-        
-    torch.save(model.cpu().state_dict(),"/home/leijingshi/DL/mid/detect/yolo-v3/weights.pt")
-    writer.close()
+                # rpn confusion matrix(meter)
+                trainer.vis.log(str(trainer.rpn_cm.value().tolist()), win='rpn_cm', iteration=ii)
+                # roi confusion matrix
+                trainer.vis.img('roi_cm', at.totensor(trainer.roi_cm.conf, False).float(), ii)
+        eval_result = eval(test_dataloader, faster_rcnn, test_num=opt.test_num)
+        trainer.vis.plot('test_map', eval_result['map'], epoch)
+        trainer.vis.plot('test_miou', eval_result['miou'], epoch)
+        lr_ = trainer.faster_rcnn.optimizer.param_groups[0]['lr']
+        log_info = 'lr:{}, map:{},loss:{}'.format(str(lr_),
+                                                  str(eval_result['map']),
+                                                  str(trainer.get_meter_data()))
+        trainer.vis.log(log_info, epoch)
 
-def test(_data, nms_conf, confidence,model,num_classes,img_size,epoch):
-    all_detections = []
-    all_annotations = []
-    l = []
-    
-    model.eval()
-    for imgs, labels in _data:
-        with torch.no_grad():
-            prediction = model(imgs)
-            outputs = predict(prediction, nms_conf, confidence)
-            l.append((model(imgs,labels)[0]).item())
-            
-        labels = labels.cpu()
-        for output, annotations in zip(outputs, labels):
-            all_detections.append([np.array([])
-                                   for _ in range(num_classes)])
-            if output is not None:
-                pred_boxes = output[:, :5].cpu().numpy()
-                scores = output[:, 4].cpu().numpy()
-                pred_labels = output[:, -1].cpu().numpy()
+        if eval_result['map'] > best_map:
+            best_map = eval_result['map']
+            best_path = trainer.save(best_map=best_map)
+        if epoch == 9:
+            trainer.load(best_path)
+            trainer.faster_rcnn.scale_lr(opt.lr_decay)
+            lr_ = lr_ * opt.lr_decay
 
-                sort_i = np.argsort(scores)
-                pred_labels = pred_labels[sort_i]
-                pred_boxes = pred_boxes[sort_i]
+        if epoch == 13: 
+            break
 
-                for label in range(num_classes):
-                    all_detections[-1][label] = pred_boxes[pred_labels == label]
 
-            all_annotations.append([np.array([])
-                                    for _ in range(num_classes)])
+if __name__ == '__main__':
+    import fire
 
-            if any(annotations[:, -1] > 0):
-                annotation_labels = annotations[annotations[:, -1]
-                                                > 0, 0].numpy()
-                _annotation_boxes = annotations[annotations[:, -1] > 0, 1:]
-
-                annotation_boxes = np.empty_like(_annotation_boxes)
-                annotation_boxes[:, 0] = _annotation_boxes[:,
-                                                           0] - _annotation_boxes[:, 2] / 2
-                annotation_boxes[:, 1] = _annotation_boxes[:,
-                                                           1] - _annotation_boxes[:, 3] / 2
-                annotation_boxes[:, 2] = _annotation_boxes[:,
-                                                           0] + _annotation_boxes[:, 2] / 2
-                annotation_boxes[:, 3] = _annotation_boxes[:,
-                                                           1] + _annotation_boxes[:, 3] / 2
-                annotation_boxes *= img_size
-
-                for label in range(num_classes):
-                    all_annotations[-1][label] = annotation_boxes[annotation_labels == label, :]
-
-    average_precisions, iou = evaluate(
-        num_classes, all_detections, all_annotations)
-
-    print(f"""{"-"*40}evaluation.{epoch}{"-"*40}""")
-    for c, ap in average_precisions.items():
-        print(f"Class '{c}' - AP: {ap}")
-
-    mAP = np.mean(list(average_precisions.values()))
-    mIoU = np.mean(iou)
-    print(f"mAP: {mAP}")
-    print(f"""{"-"*40}end{"-"*40}""")
-    model.train()
-    
-    return mAP,np.mean(l),mIoU
-
-if __name__ == "__main__":
-    train()
+    fire.Fire()
